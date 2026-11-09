@@ -1,0 +1,221 @@
+name: Build and Deploy
+
+# Reusable workflow: build a Docker image, push to Docker Hub, and render
+# Helm manifests into the shared k8-infra repo for ArgoCD.
+#
+# Call it from an app repo like:
+#   jobs:
+#     deploy:
+#       uses: VamsiPothireddy-Dev/github-actions/.github/workflows/build-deploy.yml@main
+#       with:
+#         app-name: my-app
+#         image-name: vamsipothireddy/my-app
+#       secrets: inherit
+
+on:
+  workflow_call:
+    inputs:
+      app-name:
+        description: "App name used for k8s resource names and apps/<name> folder"
+        required: true
+        type: string
+      image-name:
+        description: "Docker Hub image name (without tag)"
+        required: true
+        type: string
+      service-port:
+        description: "ClusterIP service port"
+        required: false
+        type: number
+        default: 8000
+      target-port:
+        description: "Container port the service forwards to"
+        required: false
+        type: number
+        default: 8000
+      istio-host:
+        description: "Hostname for the Istio VirtualService (empty disables it)"
+        required: false
+        type: string
+        default: ""
+      namespace:
+        description: "Target Kubernetes namespace"
+        required: false
+        type: string
+        default: "default"
+      replica-count:
+        required: false
+        type: number
+        default: 2
+      infra-repo:
+        description: "Git repo that receives rendered manifests"
+        required: false
+        type: string
+        default: "VamsiPothireddy-Dev/k8-infra"
+      chart-repo:
+        description: "Git repo containing the shared Helm chart"
+        required: false
+        type: string
+        default: "VamsiPothireddy-Dev/helm-charts"
+      chart-path:
+        description: "Path to the Helm chart inside chart-repo"
+        required: false
+        type: string
+        default: "services/services"
+
+permissions:
+  contents: read
+
+env:
+  IMAGE_TAG: sha-${{ github.sha }}
+
+jobs:
+  ensure-infra-repo:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create infra repo if it does not exist
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+          INFRA_REPO: ${{ inputs.infra-repo }}
+        run: |
+          if gh repo view "$INFRA_REPO" >/dev/null 2>&1; then
+            echo "$INFRA_REPO already exists, skipping"
+          else
+            gh repo create "$INFRA_REPO" --private \
+              --description "Kubernetes manifests for EKS (ArgoCD)"
+          fi
+
+  build-and-push:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ inputs.image-name }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=ref,event=branch
+            type=sha,prefix=sha-,format=short
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  sync-infra:
+    needs: [ensure-infra-repo, build-and-push]
+    runs-on: ubuntu-latest
+    env:
+      APP_DIR: apps/${{ inputs.app-name }}
+    steps:
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+
+      - name: Clone chart and infra repos
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+          CHART_REPO: ${{ inputs.chart-repo }}
+          INFRA_REPO: ${{ inputs.infra-repo }}
+        run: |
+          git clone --depth 1 "https://x-access-token:${GH_TOKEN}@github.com/${CHART_REPO}.git" chart-repo
+          git clone "https://x-access-token:${GH_TOKEN}@github.com/${INFRA_REPO}.git" infra
+          mkdir -p "$APP_DIR/manifests"
+
+      - name: Render manifests with helm template
+        env:
+          IMAGE_TAG: ${{ env.IMAGE_TAG }}
+          CHART_REPO: ${{ inputs.chart-repo }}
+          CHART_PATH: ${{ inputs.chart-path }}
+          APP_NAME: ${{ inputs.app-name }}
+          IMAGE_NAME: ${{ inputs.image-name }}
+          SERVICE_PORT: ${{ inputs.service-port }}
+          TARGET_PORT: ${{ inputs.target-port }}
+          ISTIO_HOST: ${{ inputs.istio-host }}
+          NAMESPACE: ${{ inputs.namespace }}
+          REPLICA_COUNT: ${{ inputs.replica-count }}
+        run: |
+          IMAGE_TAG="${IMAGE_TAG:0:11}"  # sha- + 7-char short sha, matches Docker tag
+          if [ -n "$ISTIO_HOST" ]; then ISTIO_ENABLED=true; else ISTIO_ENABLED=false; fi
+          for tpl in deployment.yaml service.yml virtualservice.yaml; do
+            # Skip the VirtualService template when Istio is disabled
+            if [ "$tpl" = "virtualservice.yaml" ] && [ "$ISTIO_ENABLED" = "false" ]; then
+              continue
+            fi
+            helm template "$APP_NAME" "./chart-repo/$CHART_PATH" \
+              --namespace "$NAMESPACE" \
+              --set "appName=$APP_NAME" \
+              --set "replicaCount=$REPLICA_COUNT" \
+              --set "image.repository=$IMAGE_NAME" \
+              --set-string "image.tag=$IMAGE_TAG" \
+              --set "service.type=ClusterIP" \
+              --set "service.port=$SERVICE_PORT" \
+              --set "service.targetPort=$TARGET_PORT" \
+              --set "istio.enabled=$ISTIO_ENABLED" \
+              --set "istio.host=$ISTIO_HOST" \
+              --set "istio.gateway=istio-system/ingressgateway" \
+              -s "templates/$tpl" \
+              > "infra/$APP_DIR/manifests/${tpl%.*}.yaml"
+          done
+          grep -n 'image:' "$APP_DIR/manifests/deployment.yaml"
+
+      - name: Write ArgoCD Application manifest
+        env:
+          APP_NAME: ${{ inputs.app-name }}
+          INFRA_REPO: ${{ inputs.infra-repo }}
+          NAMESPACE: ${{ inputs.namespace }}
+        run: |
+          cat > "infra/$APP_DIR/application.yaml" <<EOF
+          apiVersion: argoproj.io/v1alpha1
+          kind: Application
+          metadata:
+            name: $APP_NAME
+            namespace: argocd
+          spec:
+            project: default
+            source:
+              repoURL: https://github.com/$INFRA_REPO.git
+              targetRevision: HEAD
+              path: $APP_DIR/manifests
+            destination:
+              server: https://kubernetes.default.svc
+              namespace: $NAMESPACE
+            syncPolicy:
+              automated:
+                prune: true
+                selfHeal: true
+          EOF
+
+      - name: Commit and push manifests
+        working-directory: infra
+        env:
+          APP_DIR: apps/${{ inputs.app-name }}
+          APP_NAME: ${{ inputs.app-name }}
+        run: |
+          IMAGE_TAG="${IMAGE_TAG:0:11}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "$APP_DIR"
+          if git diff --cached --quiet; then
+            echo "Manifests unchanged, nothing to push"
+          else
+            git commit -m "chore: deploy $APP_NAME image $IMAGE_TAG"
+            git push
+          fi
