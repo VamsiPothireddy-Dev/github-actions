@@ -137,7 +137,7 @@ jobs:
         run: |
           git clone --depth 1 "https://x-access-token:${GH_TOKEN}@github.com/${CHART_REPO}.git" chart-repo
           git clone "https://x-access-token:${GH_TOKEN}@github.com/${INFRA_REPO}.git" infra
-          mkdir -p "$APP_DIR/manifests"
+          mkdir -p "infra/$APP_DIR/manifests"
 
       - name: Render manifests with helm template
         env:
@@ -174,7 +174,7 @@ jobs:
               -s "templates/$tpl" \
               > "infra/$APP_DIR/manifests/${tpl%.*}.yaml"
           done
-          grep -n 'image:' "$APP_DIR/manifests/deployment.yaml"
+          grep -n 'image:' "infra/$APP_DIR/manifests/deployment.yaml"
 
       - name: Write ArgoCD Application manifest
         env:
