@@ -67,7 +67,8 @@ permissions:
   contents: read
 
 env:
-  IMAGE_TAG: sha-${{ github.sha }}
+  # Single image tag: the full commit SHA of the triggering push.
+  IMAGE_TAG: ${{ github.sha }}
 
 jobs:
   ensure-infra-repo:
@@ -106,9 +107,7 @@ jobs:
         with:
           images: ${{ inputs.image-name }}
           tags: |
-            type=raw,value=latest,enable={{is_default_branch}}
-            type=ref,event=branch
-            type=sha,prefix=sha-,format=short
+            type=sha,format=long
 
       - name: Build and push image
         uses: docker/build-push-action@v6
@@ -152,7 +151,6 @@ jobs:
           NAMESPACE: ${{ inputs.namespace }}
           REPLICA_COUNT: ${{ inputs.replica-count }}
         run: |
-          IMAGE_TAG="${IMAGE_TAG:0:11}"  # sha- + 7-char short sha, matches Docker tag
           if [ -n "$ISTIO_HOST" ]; then ISTIO_ENABLED=true; else ISTIO_ENABLED=false; fi
           for tpl in deployment.yaml service.yml virtualservice.yaml; do
             # Skip the VirtualService template when Istio is disabled
@@ -209,7 +207,6 @@ jobs:
           APP_DIR: apps/${{ inputs.app-name }}
           APP_NAME: ${{ inputs.app-name }}
         run: |
-          IMAGE_TAG="${IMAGE_TAG:0:11}"
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add "$APP_DIR"
