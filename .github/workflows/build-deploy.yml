@@ -38,6 +38,11 @@ on:
         required: false
         type: string
         default: ""
+      istio-path-prefix:
+        description: "URI prefix the app is exposed under (e.g. /trade); stripped before forwarding"
+        required: false
+        type: string
+        default: ""
       namespace:
         description: "Target Kubernetes namespace"
         required: false
@@ -143,6 +148,7 @@ jobs:
           SERVICE_PORT: ${{ inputs.service-port }}
           TARGET_PORT: ${{ inputs.target-port }}
           ISTIO_HOST: ${{ inputs.istio-host }}
+          ISTIO_PATH_PREFIX: ${{ inputs.istio-path-prefix }}
           NAMESPACE: ${{ inputs.namespace }}
           REPLICA_COUNT: ${{ inputs.replica-count }}
         run: |
@@ -163,6 +169,7 @@ jobs:
               --set "service.targetPort=$TARGET_PORT" \
               --set "istio.enabled=$ISTIO_ENABLED" \
               --set "istio.host=$ISTIO_HOST" \
+              --set "istio.pathPrefix=$ISTIO_PATH_PREFIX" \
               --set "istio.gateway=istio-system/ingressgateway" \
               -s "templates/$tpl" \
               > "infra/$APP_DIR/manifests/${tpl%.*}.yaml"
